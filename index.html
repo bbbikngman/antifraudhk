@@ -355,10 +355,6 @@
 
         <div class="status-grid">
           <div class="status-item">
-            <div class="status-label">连接状态</div>
-            <div class="status-value" id="webrtcStatus">未连接</div>
-          </div>
-          <div class="status-item">
             <div class="status-label">音频状态</div>
             <div class="status-value" id="audioStatus">未激活</div>
           </div>
@@ -414,7 +410,7 @@
       const elements = {
         connectBtn: document.getElementById("connectBtn"),
         disconnectBtn: document.getElementById("disconnectBtn"),
-        webrtcStatus: document.getElementById("webrtcStatus"),
+
         audioStatus: document.getElementById("audioStatus"),
         aiStatus: document.getElementById("aiStatus"),
         latency: document.getElementById("latency"),
@@ -493,8 +489,7 @@
             await this.audioSender.startRecording(localStream);
 
             this.state = ConnectionState.CONNECTED;
-            elements.webrtcStatus.textContent = "WebSocket音频";
-            elements.webrtcStatus.className = "status-value success";
+
             elements.systemStatus.textContent = "WebSocket已连接";
             elements.aiStatus.textContent = "在线";
             elements.aiStatus.className = "status-value success";
@@ -552,10 +547,6 @@
 
           // 显示错误建议
           log(`连接失败建议: 请检查网络连接或刷新页面重试`, "info");
-
-          // 更新UI状态
-          elements.webrtcStatus.textContent = "连接失败";
-          elements.webrtcStatus.className = "status-value error";
         }
 
         async disconnect() {
@@ -646,22 +637,25 @@
 
         sendPCMChunk(pcmData) {
           try {
-            // 简单的音频活动检测（前端预打断）
-            const rms = Math.sqrt(
-              pcmData.reduce((sum, sample) => sum + sample * sample, 0) /
-                pcmData.length
-            );
-            const isActive = rms > 0.01; // 简单的阈值检测
+            // 前端预打断机制已禁用 - 必须依赖后端Whisper转写结果判断打断
+            // 原因：前端简单的RMS检测会绕过后端的黑名单过滤，导致误触发
+            // 现在所有打断决策都由后端的AudioProcessor.process_audio_with_interrupt_decision()处理
 
-            // 如果检测到音频活动且有音频正在播放，立即触发前端打断
-            if (
-              isActive &&
-              connectionManager.audioReceiver &&
-              connectionManager.audioReceiver.isPlaying
-            ) {
-              connectionManager.audioReceiver.clearQueue();
-              // 注意：后端的VAD会进行更精确的打断检测
-            }
+            // const rms = Math.sqrt(
+            //   pcmData.reduce((sum, sample) => sum + sample * sample, 0) /
+            //     pcmData.length
+            // );
+            // const isActive = rms > 0.01; // 简单的阈值检测
+            //
+            // // 如果检测到音频活动且有音频正在播放，立即触发前端打断
+            // if (
+            //   isActive &&
+            //   connectionManager.audioReceiver &&
+            //   connectionManager.audioReceiver.isPlaying
+            // ) {
+            //   connectionManager.audioReceiver.clearQueue();
+            //   // 注意：后端的VAD会进行更精确的打断检测
+            // }
 
             // 转换Float32到Int16（标准音频格式）
             const int16Data = new Int16Array(pcmData.length);
@@ -1380,6 +1374,11 @@
             break;
           case "interrupt_signal":
             log("收到打断信号", "warning");
+            // 立即清空音频播放队列
+            if (connectionManager.audioReceiver) {
+              connectionManager.audioReceiver.clearQueue();
+              log("🛑 根据后端打断信号清空音频队列", "info");
+            }
             break;
           case "audio_response":
             // 处理WebSocket音频回复
@@ -1448,8 +1447,7 @@
           initAudioVisualization();
 
           elements.connectionStatus.textContent = "WebSocket已连接";
-          elements.webrtcStatus.textContent = "WebSocket音频";
-          elements.webrtcStatus.className = "status-value success";
+
           elements.systemStatus.textContent = "已连接";
           elements.disconnectBtn.disabled = false;
           log("✅ WebSocket服务器连接成功！", "success");
@@ -1488,8 +1486,7 @@
           // 重置UI状态
           elements.connectBtn.disabled = false;
           elements.disconnectBtn.disabled = true;
-          elements.webrtcStatus.textContent = "未连接";
-          elements.webrtcStatus.className = "status-value";
+
           elements.audioStatus.textContent = "未激活";
           elements.audioStatus.className = "status-value";
           elements.connectionStatus.textContent = "WebSocket已连接";
