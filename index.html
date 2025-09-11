@@ -1818,6 +1818,7 @@
                 timestamp: message.timestamp,
                 sequence: message.sequence,
                 has_audio: message.has_audio || false,
+                audio_format: message.audio_format || "webm", // 🔧 修复：包含音频格式字段
               };
 
               // 只有当有音频数据时才传递data字段
