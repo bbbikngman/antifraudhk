@@ -536,6 +536,9 @@
             this.audioSender = new AudioSender(websocket);
             this.audioReceiver = new AudioReceiver(websocket);
 
+            // 🆕 初始化全局Audio对象（在用户手势中）
+            await this.audioReceiver.initGlobalAudio();
+
             // 开始音频录制和发送
             await this.audioSender.startRecording(localStream);
 
@@ -978,16 +981,135 @@
         }
       }
 
-      // 音频接收器类 - 简化为只支持WebSocket
+      // 音频接收器类 - 使用单一Audio对象复用策略
       class AudioReceiver {
         constructor(connection) {
           this.connection = connection;
           this.audioQueue = [];
           this.isPlaying = false;
-          this.currentAudio = null;
+
+          // 🆕 单一Audio对象复用策略
+          this.globalAudio = null;
+          this.audioPermissionGranted = false;
+          this.currentAudioUrl = null;
+
           this.playbackSequence = 0;
           this.retryCount = 0;
           this.maxRetries = 3;
+        }
+
+        // 🆕 初始化全局Audio对象
+        async initGlobalAudio() {
+          if (!this.globalAudio) {
+            this.globalAudio = new Audio();
+
+            // 设置全局事件监听器
+            this.globalAudio.onended = () => {
+              this.cleanupCurrentAudio();
+              this.retryCount = 0;
+              log(`✅ 音频播放完成`);
+              // 继续播放下一个
+              this.playNextAudio();
+            };
+
+            this.globalAudio.onerror = (error) => {
+              log(`❌ 音频播放错误: ${error.message || error}`, "error");
+              this.handleAudioError(error);
+            };
+
+            this.globalAudio.onloadstart = () => {
+              log(`🎵 开始播放音频`, "info");
+            };
+
+            this.globalAudio.oncanplay = () => {
+              log(`📻 音频已准备就绪`);
+            };
+
+            // 苹果设备需要在用户手势中激活
+            if (isAppleDevice()) {
+              await this.activateAppleAudio();
+            }
+
+            log("✅ 全局Audio对象初始化完成", "success");
+          }
+        }
+
+        // 🆕 苹果设备音频权限激活
+        async activateAppleAudio() {
+          try {
+            log("🍎 激活苹果设备音频权限...", "info");
+
+            // 确保AudioContext处于运行状态
+            if (audioContext && audioContext.state === "suspended") {
+              await audioContext.resume();
+              log("✅ AudioContext已激活");
+            }
+
+            // 播放极短的静音音频来获取权限
+            const silentAudio =
+              "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT";
+
+            this.globalAudio.src = silentAudio;
+            this.globalAudio.volume = 0.01;
+
+            await this.globalAudio.play();
+            this.globalAudio.pause();
+
+            this.audioPermissionGranted = true;
+            log("✅ 苹果设备音频权限已获得", "success");
+          } catch (error) {
+            log(`苹果设备音频权限获取失败: ${error.message}`, "error");
+            throw error;
+          }
+        }
+
+        // 🆕 清理当前音频资源
+        cleanupCurrentAudio() {
+          if (this.currentAudioUrl) {
+            URL.revokeObjectURL(this.currentAudioUrl);
+            this.currentAudioUrl = null;
+          }
+        }
+
+        // 🆕 处理音频播放错误
+        handleAudioError(error) {
+          // 苹果设备特殊错误处理
+          if (isAppleDevice()) {
+            log(`🍎 苹果设备音频播放错误: ${error.message || error}`, "error");
+
+            if (!this.audioPermissionGranted) {
+              log("💡 可能需要重新获取音频权限", "warning");
+            }
+          }
+
+          // 使用错误监控系统
+          errorMonitor.logError("audio", error, {
+            retryCount: this.retryCount,
+            queueLength: this.audioQueue.length,
+            isAppleDevice: isAppleDevice(),
+            audioPermissionGranted: this.audioPermissionGranted,
+            audioContextState: audioContext ? audioContext.state : "none",
+          });
+
+          this.cleanupCurrentAudio();
+          stats.errors++;
+
+          // 重试机制
+          if (this.retryCount < this.maxRetries) {
+            this.retryCount++;
+            log(
+              `🔄 音频播放重试 (${this.retryCount}/${this.maxRetries})`,
+              "warning"
+            );
+
+            // 延迟重试
+            setTimeout(() => this.playNextAudio(), 500 * this.retryCount);
+          } else {
+            log("❌ 音频播放重试次数已达上限", "error");
+            this.retryCount = 0;
+            // 尝试播放下一个音频
+            setTimeout(() => this.playNextAudio(), 100);
+          }
         }
 
         handleIncomingAudio(audioData, metadata = {}) {
@@ -1129,10 +1251,17 @@
           }
         }
 
+        // 🔄 重构：使用全局Audio对象的播放逻辑
         async playNextAudio() {
           if (this.audioQueue.length === 0) {
             this.isPlaying = false;
             return;
+          }
+
+          // 确保全局Audio对象已初始化
+          if (!this.globalAudio) {
+            log("⚠️ 全局Audio对象未初始化，正在初始化...", "warning");
+            await this.initGlobalAudio();
           }
 
           this.isPlaying = true;
@@ -1140,183 +1269,64 @@
 
           try {
             let audioBlob;
-            let mimeType;
             let formatName;
 
             // 根据音频格式创建正确的Blob
             if (audioItem.format === "mp3") {
-              // MP3格式（新的优化格式）
               audioBlob = audioItem.blob;
-              mimeType = "audio/mpeg";
               formatName = "MP3";
             } else {
-              // WebM格式（向后兼容）
               audioBlob = new Blob([audioItem.data], { type: "audio/webm" });
-              mimeType = "audio/webm";
               formatName = "WebM";
             }
 
-            const audioUrl = URL.createObjectURL(audioBlob);
-            this.currentAudio = new Audio(audioUrl);
+            // 清理之前的音频URL
+            this.cleanupCurrentAudio();
 
-            // 苹果设备特殊处理
+            // 创建新的音频URL并设置到全局Audio对象
+            this.currentAudioUrl = URL.createObjectURL(audioBlob);
+            this.globalAudio.src = this.currentAudioUrl;
+
+            // 设置音频属性
+            this.globalAudio.preload = "auto";
             if (isAppleDevice()) {
-              // 确保AudioContext已初始化
-              if (!audioContextInitialized && audioContext) {
-                if (audioContext.state === "suspended") {
-                  await audioContext.resume();
-                }
-              }
-
-              // 设置音频属性以提高兼容性
-              this.currentAudio.preload = "auto";
-              this.currentAudio.crossOrigin = "anonymous";
+              this.globalAudio.crossOrigin = "anonymous";
             }
 
-            // 设置音频事件处理
-            this.currentAudio.onended = () => {
-              URL.revokeObjectURL(audioUrl);
-              this.currentAudio = null;
-              this.retryCount = 0; // 重置重试计数器
-              log(`✅ ${formatName}音频播放完成`);
-              // 播放下一个音频
-              this.playNextAudio();
-            };
+            // 更新日志信息（包含文本内容）
+            const audioText = audioItem.text || "无文本";
+            log(`🎵 准备播放${formatName}音频: "${audioText}"`, "info");
 
-            this.currentAudio.onerror = (error) => {
-              // 苹果设备特殊错误处理
-              if (isAppleDevice()) {
-                log(
-                  `🍎 苹果设备音频播放错误: ${error.message || error}`,
-                  "error"
-                );
-                log(
-                  "💡 苹果设备音频播放失败，可能原因: 1) 需要用户手势触发 2) 音频格式不支持 3) HTTPS问题",
-                  "warning"
-                );
-              }
+            // 🎯 关键改进：使用全局Audio对象播放
+            await this.globalAudio.play();
 
-              // 使用错误监控系统
-              errorMonitor.logError("audio", error, {
-                format: formatName,
-                audioSize: audioBlob.size,
-                retryCount: this.retryCount,
-                queueLength: this.audioQueue.length,
-                isAppleDevice: isAppleDevice(),
-                audioContextState: audioContext ? audioContext.state : "none",
-              });
-
-              URL.revokeObjectURL(audioUrl);
-              this.currentAudio = null;
-              stats.errors++;
-
-              // 重试机制
-              if (this.retryCount < this.maxRetries) {
-                this.retryCount++;
-                log(
-                  `🔄 音频播放重试 (${this.retryCount}/${this.maxRetries})`,
-                  "warning"
-                );
-
-                // 将当前项目重新加入队列头部
-                this.audioQueue.unshift(audioItem);
-                setTimeout(() => this.playNextAudio(), 500 * this.retryCount);
-              } else {
-                errorMonitor.logError("audio", new Error("音频播放重试失败"), {
-                  format: formatName,
-                  maxRetries: this.maxRetries,
-                  finalFailure: true,
-                  isAppleDevice: isAppleDevice(),
-                });
-                this.retryCount = 0;
-                // 尝试播放下一个音频
-                setTimeout(() => this.playNextAudio(), 100);
-              }
-            };
-
-            this.currentAudio.onloadstart = () => {
-              log(
-                `🎵 开始播放${formatName}音频: "${audioItem.text || "无文本"}"`,
-                "info"
-              );
-            };
-
-            this.currentAudio.oncanplay = () => {
-              log(`📻 ${formatName}音频已准备就绪`);
-            };
-
-            // 开始播放 - 苹果设备特殊处理
-            if (isAppleDevice()) {
-              // 苹果设备需要特殊的播放权限处理
-              try {
-                // 确保AudioContext处于运行状态
-                if (audioContext && audioContext.state === "suspended") {
-                  await audioContext.resume();
-                  log("🔧 AudioContext已恢复");
-                }
-
-                // 设置音频属性以提高兼容性
-                this.currentAudio.preload = "auto";
-                this.currentAudio.crossOrigin = "anonymous";
-
-                // 尝试播放
-                const playPromise = this.currentAudio.play();
-                if (playPromise !== undefined) {
-                  await playPromise;
-                }
-              } catch (playError) {
-                // 如果播放失败，尝试重新获取权限
-                if (
-                  playError.name === "NotAllowedError" ||
-                  playError.message.includes("not supported")
-                ) {
-                  log(
-                    "🍎 检测到苹果设备权限问题，尝试重新获取权限...",
-                    "warning"
-                  );
-
-                  // 显示用户提示
-                  log("💡 请点击页面任意位置以激活音频播放权限", "info");
-
-                  // 创建一个点击监听器来重新获取权限
-                  const enableAudio = async () => {
-                    try {
-                      if (audioContext && audioContext.state === "suspended") {
-                        await audioContext.resume();
-                      }
-
-                      // 重新尝试播放
-                      await this.currentAudio.play();
-                      document.removeEventListener("click", enableAudio);
-                      document.removeEventListener("touchstart", enableAudio);
-                      log("✅ 音频播放权限已激活", "success");
-                    } catch (retryError) {
-                      log(`重试播放失败: ${retryError.message}`, "error");
-                    }
-                  };
-
-                  document.addEventListener("click", enableAudio, {
-                    once: true,
-                  });
-                  document.addEventListener("touchstart", enableAudio, {
-                    once: true,
-                  });
-
-                  throw playError; // 重新抛出错误以触发错误处理
-                } else {
-                  throw playError;
-                }
-              }
-            } else {
-              // 非苹果设备的正常播放
-              await this.currentAudio.play();
-            }
+            log(`✅ ${formatName}音频开始播放`, "success");
           } catch (error) {
             log(`音频播放失败: ${error.message}`, "error");
-            stats.errors++;
 
-            // 尝试播放下一个音频
-            setTimeout(() => this.playNextAudio(), 100);
+            // 如果是权限问题且是苹果设备
+            if (
+              isAppleDevice() &&
+              (error.name === "NotAllowedError" ||
+                error.message.includes("not supported"))
+            ) {
+              log("🍎 苹果设备权限问题，尝试重新激活...", "warning");
+
+              try {
+                // 重新激活音频权限
+                await this.activateAppleAudio();
+                // 将当前音频重新加入队列头部
+                this.audioQueue.unshift(audioItem);
+                // 重试播放
+                setTimeout(() => this.playNextAudio(), 100);
+                return;
+              } catch (activateError) {
+                log(`权限重新激活失败: ${activateError.message}`, "error");
+              }
+            }
+
+            // 使用统一的错误处理
+            this.handleAudioError(error);
           }
         }
 
@@ -1325,12 +1335,14 @@
           const queueLength = this.audioQueue.length;
           const wasPlaying = this.isPlaying;
 
-          // 停止当前播放
-          if (this.currentAudio) {
-            this.currentAudio.pause();
-            this.currentAudio.currentTime = 0;
-            this.currentAudio = null;
+          // 停止当前播放 - 使用全局Audio对象
+          if (this.globalAudio) {
+            this.globalAudio.pause();
+            this.globalAudio.currentTime = 0;
           }
+
+          // 清理音频资源
+          this.cleanupCurrentAudio();
 
           // 清空队列
           this.audioQueue = [];
@@ -1346,20 +1358,38 @@
 
         // 暂停当前播放
         pause() {
-          if (this.currentAudio) {
-            this.currentAudio.pause();
+          if (this.globalAudio) {
+            this.globalAudio.pause();
           }
           this.isPlaying = false;
         }
 
         // 恢复播放
         resume() {
-          if (this.currentAudio && this.currentAudio.paused) {
-            this.currentAudio.play().catch((error) => {
+          if (this.globalAudio && this.globalAudio.paused) {
+            this.globalAudio.play().catch((error) => {
               log(`恢复播放失败: ${error.message}`, "error");
             });
             this.isPlaying = true;
           }
+        }
+
+        // 🆕 停止播放并清理资源
+        stop() {
+          if (this.globalAudio) {
+            this.globalAudio.pause();
+            this.globalAudio.currentTime = 0;
+            // 移除事件监听器
+            this.globalAudio.onended = null;
+            this.globalAudio.onerror = null;
+            this.globalAudio.onloadstart = null;
+            this.globalAudio.oncanplay = null;
+          }
+          this.cleanupCurrentAudio();
+          this.clearQueue();
+          this.globalAudio = null;
+          this.audioPermissionGranted = false;
+          log("🛑 AudioReceiver已停止", "info");
         }
 
         // 处理音频控制指令
