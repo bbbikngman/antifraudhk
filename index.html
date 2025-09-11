@@ -339,11 +339,11 @@
         <div class="connection-info">
           <div>
             <strong>WebSocket服务:</strong>
-            <span id="websocketAddress">ws://81.71.152.21:31004</span>
+            <span id="websocketAddress">wss://cityuantifraud.com/ws</span>
           </div>
           <div>
             <strong>WebSocket:</strong>
-            <span id="wsAddress">ws://81.71.152.21:31004</span>
+            <span id="wsAddress">wss://cityuantifraud.com/ws</span>
           </div>
           <div>
             <strong>连接状态:</strong> <span id="connectionStatus">未连接</span>
@@ -395,6 +395,15 @@
       let audioContext = null;
       let analyser = null;
 
+      // 苹果设备检测和音频权限管理
+      const isAppleDevice = () => {
+        return /iPad|iPhone|iPod|Macintosh|Mac OS X/.test(navigator.userAgent);
+      };
+
+      // 音频权限预获取标志
+      let audioPermissionGranted = false;
+      let audioContextInitialized = false;
+
       // WebSocket重连相关变量
       let websocketReconnecting = false;
       let reconnectAttempts = 0;
@@ -403,7 +412,7 @@
       let dataArray = null;
       let animationId = null;
 
-      // 服务器配置 - 只使用WebSocket
+      // 服务器配置 - 香港HTTPS版本
       const WS_URL = "wss://cityuantifraud.com/ws";
 
       // DOM元素
@@ -451,6 +460,24 @@
             log("🚀 开始连接WebSocket音频服务...");
             elements.connectBtn.disabled = true;
             elements.systemStatus.textContent = "连接中...";
+
+            // 苹果设备特殊处理
+            if (isAppleDevice()) {
+              log("🍎 检测到苹果设备，执行特殊音频权限处理...", "warning");
+
+              // 检查HTTPS
+              if (
+                location.protocol !== "https:" &&
+                location.hostname !== "localhost"
+              ) {
+                throw new Error(
+                  "苹果设备需要HTTPS才能正常使用音频功能，请使用HTTPS访问"
+                );
+              }
+
+              // 预获取音频播放权限
+              await this.initAppleAudioPermissions();
+            }
 
             // 检查浏览器兼容性
             if (
@@ -540,13 +567,57 @@
           initAudioVisualization();
         }
 
+        async initAppleAudioPermissions() {
+          try {
+            log("🔧 初始化苹果设备音频权限...");
+
+            // 创建AudioContext并激活
+            if (!audioContextInitialized) {
+              const AudioContextClass =
+                window.AudioContext || window.webkitAudioContext;
+              if (!audioContext) {
+                audioContext = new AudioContextClass();
+              }
+
+              // 恢复AudioContext（苹果设备需要用户手势触发）
+              if (audioContext.state === "suspended") {
+                await audioContext.resume();
+                log("✅ AudioContext已激活");
+              }
+
+              // 播放一个静音音频来获取播放权限
+              const buffer = audioContext.createBuffer(1, 1, 22050);
+              const source = audioContext.createBufferSource();
+              source.buffer = buffer;
+              source.connect(audioContext.destination);
+              source.start();
+
+              audioContextInitialized = true;
+              log("✅ 苹果设备音频权限预获取成功");
+            }
+
+            audioPermissionGranted = true;
+          } catch (error) {
+            log(`苹果设备音频权限获取失败: ${error.message}`, "error");
+            throw new Error("音频权限获取失败，请确保允许音频播放权限");
+          }
+        }
+
         handleConnectionError(error) {
           elements.connectBtn.disabled = false;
           elements.systemStatus.textContent = "连接失败";
           stats.errors++;
 
-          // 显示错误建议
-          log(`连接失败建议: 请检查网络连接或刷新页面重试`, "info");
+          // 苹果设备特殊错误提示
+          if (isAppleDevice() && error.message.includes("音频")) {
+            log(`🍎 苹果设备音频问题: ${error.message}`, "error");
+            log(
+              "💡 建议: 1) 确保使用HTTPS 2) 点击页面任意位置后重试 3) 检查Safari音频权限",
+              "info"
+            );
+          } else {
+            log(`连接失败建议: 请检查网络连接或刷新页面重试`, "info");
+          }
         }
 
         async disconnect() {
@@ -1008,6 +1079,20 @@
             const audioUrl = URL.createObjectURL(audioBlob);
             this.currentAudio = new Audio(audioUrl);
 
+            // 苹果设备特殊处理
+            if (isAppleDevice()) {
+              // 确保AudioContext已初始化
+              if (!audioContextInitialized && audioContext) {
+                if (audioContext.state === "suspended") {
+                  await audioContext.resume();
+                }
+              }
+
+              // 设置音频属性以提高兼容性
+              this.currentAudio.preload = "auto";
+              this.currentAudio.crossOrigin = "anonymous";
+            }
+
             // 设置音频事件处理
             this.currentAudio.onended = () => {
               URL.revokeObjectURL(audioUrl);
@@ -1019,12 +1104,26 @@
             };
 
             this.currentAudio.onerror = (error) => {
+              // 苹果设备特殊错误处理
+              if (isAppleDevice()) {
+                log(
+                  `🍎 苹果设备音频播放错误: ${error.message || error}`,
+                  "error"
+                );
+                log(
+                  "💡 苹果设备音频播放失败，可能原因: 1) 需要用户手势触发 2) 音频格式不支持 3) HTTPS问题",
+                  "warning"
+                );
+              }
+
               // 使用错误监控系统
               errorMonitor.logError("audio", error, {
                 format: formatName,
                 audioSize: audioBlob.size,
                 retryCount: this.retryCount,
                 queueLength: this.audioQueue.length,
+                isAppleDevice: isAppleDevice(),
+                audioContextState: audioContext ? audioContext.state : "none",
               });
 
               URL.revokeObjectURL(audioUrl);
@@ -1047,6 +1146,7 @@
                   format: formatName,
                   maxRetries: this.maxRetries,
                   finalFailure: true,
+                  isAppleDevice: isAppleDevice(),
                 });
                 this.retryCount = 0;
                 // 尝试播放下一个音频
