@@ -993,6 +993,10 @@
           this.audioPermissionGranted = false;
           this.currentAudioUrl = null;
 
+          // 🆕 Web Audio API支持（苹果设备打断机制）
+          this.currentWebAudioSource = null;
+          this.isUsingWebAudio = false;
+
           this.playbackSequence = 0;
           this.retryCount = 0;
           this.maxRetries = 3;
@@ -1037,28 +1041,91 @@
         // 🆕 苹果设备音频权限激活
         async activateAppleAudio() {
           try {
-            log("🍎 激活苹果设备音频权限...", "info");
+            log("🍎 激活苹果设备音频权限（Web Audio API）...", "info");
 
             // 确保AudioContext处于运行状态
-            if (audioContext && audioContext.state === "suspended") {
+            if (!audioContext) {
+              const AudioContextClass =
+                window.AudioContext || window.webkitAudioContext;
+              audioContext = new AudioContextClass();
+            }
+
+            if (audioContext.state === "suspended") {
               await audioContext.resume();
               log("✅ AudioContext已激活");
             }
 
-            // 播放极短的静音音频来获取权限
-            const silentAudio =
-              "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT";
-
-            this.globalAudio.src = silentAudio;
-            this.globalAudio.volume = 0.01;
-
-            await this.globalAudio.play();
-            this.globalAudio.pause();
+            // 🎯 苹果设备使用Web Audio API，不使用Audio元素
+            // 播放一个极短的静音buffer来获取权限
+            const buffer = audioContext.createBuffer(1, 1, 22050);
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+            source.start();
 
             this.audioPermissionGranted = true;
-            log("✅ 苹果设备音频权限已获得", "success");
+            log("✅ 苹果设备Web Audio API权限已获得", "success");
           } catch (error) {
             log(`苹果设备音频权限获取失败: ${error.message}`, "error");
+            throw error;
+          }
+        }
+
+        // 🆕 苹果设备专用：Web Audio API播放MP3
+        async playMP3WithWebAudio(mp3Data, audioText) {
+          try {
+            log(`🍎 使用Web Audio API播放: "${audioText}"`, "info");
+
+            // 解码Base64 MP3数据
+            const binaryString = atob(mp3Data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+
+            // 使用Web Audio API解码MP3
+            const audioBuffer = await audioContext.decodeAudioData(
+              bytes.buffer
+            );
+
+            // 🎯 关键：停止之前的Web Audio播放（支持打断）
+            if (this.currentWebAudioSource) {
+              try {
+                this.currentWebAudioSource.stop();
+                log("🛑 停止之前的Web Audio播放", "info");
+              } catch (stopError) {
+                // 忽略已经停止的source的错误
+              }
+            }
+
+            // 创建新的音频源
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+
+            // 🎯 保存当前播放源（用于打断控制）
+            this.currentWebAudioSource = source;
+            this.isUsingWebAudio = true;
+
+            // 设置播放完成回调
+            source.onended = () => {
+              // 只有正常播放完成才继续下一个（被打断时不会触发）
+              if (this.currentWebAudioSource === source) {
+                this.currentWebAudioSource = null;
+                this.isUsingWebAudio = false;
+                this.retryCount = 0;
+                log(`✅ Web Audio API播放完成: "${audioText}"`);
+                // 继续播放下一个音频
+                this.playNextAudio();
+              }
+            };
+
+            source.start();
+            log(`✅ Web Audio API播放开始`, "success");
+          } catch (error) {
+            this.currentWebAudioSource = null;
+            this.isUsingWebAudio = false;
+            log(`Web Audio API播放失败: ${error.message}`, "error");
             throw error;
           }
         }
@@ -1297,9 +1364,31 @@
             const audioText = audioItem.text || "无文本";
             log(`🎵 准备播放${formatName}音频: "${audioText}"`, "info");
 
-            // 🎯 关键改进：使用全局Audio对象播放
-            await this.globalAudio.play();
+            // � 苹果设进备特殊处理：MP3使用Web Audio API
+            if (isAppleDevice() && audioItem.format === "mp3") {
+              log("🍎 苹果设备使用Web Audio API播放MP3", "info");
 
+              // 从Blob读取Base64数据
+              const reader = new FileReader();
+              reader.onload = async () => {
+                try {
+                  const base64Data = reader.result.split(",")[1]; // 移除data:audio/mpeg;base64,前缀
+                  await this.playMP3WithWebAudio(base64Data, audioText);
+                } catch (webAudioError) {
+                  log(
+                    `Web Audio API播放失败，降级到Audio元素: ${webAudioError.message}`,
+                    "warning"
+                  );
+                  // 降级到Audio元素播放
+                  await this.globalAudio.play();
+                }
+              };
+              reader.readAsDataURL(audioBlob);
+              return; // 提前返回，不执行下面的Audio元素播放
+            }
+
+            // 🖥️ 非苹果设备或WebM格式：使用Audio元素播放
+            await this.globalAudio.play();
             log(`✅ ${formatName}音频开始播放`, "success");
           } catch (error) {
             log(`音频播放失败: ${error.message}`, "error");
@@ -1330,12 +1419,24 @@
           }
         }
 
-        // 清空播放队列（用于打断）
+        // 清空播放队列（用于打断）- 支持Web Audio API
         clearQueue() {
           const queueLength = this.audioQueue.length;
           const wasPlaying = this.isPlaying;
 
-          // 停止当前播放 - 使用全局Audio对象
+          // 🎯 停止Web Audio API播放（苹果设备）
+          if (this.currentWebAudioSource) {
+            try {
+              this.currentWebAudioSource.stop();
+              log("🛑 停止Web Audio API播放", "info");
+            } catch (stopError) {
+              // 忽略已经停止的source的错误
+            }
+            this.currentWebAudioSource = null;
+            this.isUsingWebAudio = false;
+          }
+
+          // 🎯 停止Audio元素播放（其他设备）
           if (this.globalAudio) {
             this.globalAudio.pause();
             this.globalAudio.currentTime = 0;
@@ -1356,16 +1457,38 @@
           }
         }
 
-        // 暂停当前播放
+        // 暂停当前播放 - 支持Web Audio API
         pause() {
+          // 🎯 Web Audio API无法暂停，只能停止
+          if (this.isUsingWebAudio && this.currentWebAudioSource) {
+            try {
+              this.currentWebAudioSource.stop();
+              log("🛑 停止Web Audio API播放（无法暂停）", "info");
+            } catch (stopError) {
+              // 忽略错误
+            }
+            this.currentWebAudioSource = null;
+            this.isUsingWebAudio = false;
+          }
+
+          // 🎯 Audio元素可以暂停
           if (this.globalAudio) {
             this.globalAudio.pause();
           }
+
           this.isPlaying = false;
         }
 
-        // 恢复播放
+        // 恢复播放 - Web Audio API限制说明
         resume() {
+          // 🎯 Web Audio API无法恢复，只能重新播放下一个
+          if (this.isUsingWebAudio) {
+            log("⚠️ Web Audio API无法恢复播放，将播放下一个音频", "warning");
+            this.playNextAudio();
+            return;
+          }
+
+          // 🎯 Audio元素可以恢复
           if (this.globalAudio && this.globalAudio.paused) {
             this.globalAudio.play().catch((error) => {
               log(`恢复播放失败: ${error.message}`, "error");
@@ -1374,8 +1497,20 @@
           }
         }
 
-        // 🆕 停止播放并清理资源
+        // 🆕 停止播放并清理资源 - 支持Web Audio API
         stop() {
+          // 🎯 停止Web Audio API
+          if (this.currentWebAudioSource) {
+            try {
+              this.currentWebAudioSource.stop();
+            } catch (stopError) {
+              // 忽略错误
+            }
+            this.currentWebAudioSource = null;
+            this.isUsingWebAudio = false;
+          }
+
+          // 🎯 停止Audio元素
           if (this.globalAudio) {
             this.globalAudio.pause();
             this.globalAudio.currentTime = 0;
@@ -1385,6 +1520,7 @@
             this.globalAudio.onloadstart = null;
             this.globalAudio.oncanplay = null;
           }
+
           this.cleanupCurrentAudio();
           this.clearQueue();
           this.globalAudio = null;
