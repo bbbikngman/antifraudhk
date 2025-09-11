@@ -1038,10 +1038,16 @@
           }
         }
 
-        // 🆕 苹果设备音频权限激活
+        // 🆕 苹果设备音频权限激活 - 简化版本
         async activateAppleAudio() {
           try {
-            log("🍎 激活苹果设备音频权限（Web Audio API）...", "info");
+            log("🍎 检查苹果设备音频权限状态...", "info");
+
+            // 如果已经激活过，直接返回
+            if (this.audioPermissionGranted) {
+              log("✅ 苹果设备音频权限已存在", "success");
+              return;
+            }
 
             // 确保AudioContext处于运行状态
             if (!audioContext) {
@@ -1055,19 +1061,17 @@
               log("✅ AudioContext已激活");
             }
 
-            // 🎯 苹果设备使用Web Audio API，不使用Audio元素
-            // 播放一个极短的静音buffer来获取权限
-            const buffer = audioContext.createBuffer(1, 1, 22050);
-            const source = audioContext.createBufferSource();
-            source.buffer = buffer;
-            source.connect(audioContext.destination);
-            source.start();
-
-            this.audioPermissionGranted = true;
-            log("✅ 苹果设备Web Audio API权限已获得", "success");
+            // 🎯 不在这里播放任何音频，只检查AudioContext状态
+            if (audioContext.state === "running") {
+              this.audioPermissionGranted = true;
+              log("✅ 苹果设备Web Audio API已准备就绪", "success");
+            } else {
+              log("⚠️ AudioContext状态异常，将在播放时重试", "warning");
+            }
           } catch (error) {
-            log(`苹果设备音频权限获取失败: ${error.message}`, "error");
-            throw error;
+            log(`苹果设备音频权限检查失败: ${error.message}`, "warning");
+            // 不抛出错误，让连接继续进行
+            log("⚠️ 将在实际播放时重试权限获取", "info");
           }
         }
 
@@ -1075,6 +1079,18 @@
         async playMP3WithWebAudio(mp3Data, audioText) {
           try {
             log(`🍎 使用Web Audio API播放: "${audioText}"`, "info");
+
+            // 确保AudioContext处于运行状态
+            if (!audioContext) {
+              const AudioContextClass =
+                window.AudioContext || window.webkitAudioContext;
+              audioContext = new AudioContextClass();
+            }
+
+            if (audioContext.state === "suspended") {
+              await audioContext.resume();
+              log("✅ AudioContext已恢复");
+            }
 
             // 解码Base64 MP3数据
             const binaryString = atob(mp3Data);
@@ -1120,8 +1136,12 @@
               }
             };
 
+            // 🎯 在真正播放时才获取权限
             source.start();
             log(`✅ Web Audio API播放开始`, "success");
+
+            // 标记权限已获得
+            this.audioPermissionGranted = true;
           } catch (error) {
             this.currentWebAudioSource = null;
             this.isUsingWebAudio = false;
@@ -2003,62 +2023,52 @@
         event.preventDefault();
       });
 
-      // 苹果设备音频权限预处理
+      // 苹果设备音频权限预处理 - 简化版本
       function setupAppleDeviceAudioSupport() {
         if (isAppleDevice()) {
-          log("🍎 检测到苹果设备，设置音频权限监听器...", "info");
+          log("🍎 检测到苹果设备，设置音频权限策略...", "info");
 
-          // 创建全局点击监听器来激活音频权限
+          // 简单的用户交互监听器，只激活AudioContext
           const activateAudioOnInteraction = async (event) => {
             try {
               if (!audioPermissionGranted) {
-                log("🔧 用户交互触发，尝试激活音频权限...", "info");
+                log("🔧 用户交互触发，激活AudioContext...", "info");
 
-                // 创建AudioContext
+                // 只激活AudioContext，不尝试播放Audio元素
                 if (!audioContext) {
                   const AudioContextClass =
                     window.AudioContext || window.webkitAudioContext;
                   audioContext = new AudioContextClass();
                 }
 
-                // 恢复AudioContext
                 if (audioContext.state === "suspended") {
                   await audioContext.resume();
                   log("✅ AudioContext已激活");
                 }
 
-                // 播放静音音频获取权限
-                const testAudio = new Audio();
-                testAudio.src =
-                  "data:audio/mpeg;base64,SUQzBAAAAAABEVRYWFgAAAAtAAADY29tbWVudABCaWdTb3VuZEJhbmsuY29tIC8gTGFTb25vdGhlcXVlLm9yZwBURU5DAAAAHQAAAW1wM1BST0R1Y2VkIGJ5IEF1ZGFjaXR5AFRJVDIAAAAOAAABzlNvbWV0aGluZyBFbHNlAFRQRTEAAAARAAABzlRoZSBLaWxsZXJzAFRBTEIAAAAQAAABzkRheSAmIEFnZQBUWUVSAAAAFQAAAdBUaGUgS2lsbGVycwBUQ09OAAAAFQAAAQBUZXN0IENvbW1lbnQAVENPUAAAABUAAAEAVGVzdCBDb21tZW50AFRQT1MAAAASAAABADEAVFJDSwAAABIAAAEAMQA=";
-                testAudio.volume = 0.01;
+                // 标记为已激活
+                audioPermissionGranted = true;
 
-                try {
-                  await testAudio.play();
-                  audioPermissionGranted = true;
-                  log("✅ 苹果设备音频权限已激活", "success");
-
-                  // 隐藏提示
-                  const hint = document.getElementById("appleAudioHint");
-                  if (hint) {
-                    hint.style.display = "none";
-                  }
-
-                  // 移除监听器
-                  document.removeEventListener(
-                    "click",
-                    activateAudioOnInteraction
-                  );
-                  document.removeEventListener(
-                    "touchstart",
-                    activateAudioOnInteraction
-                  );
-                } catch (playError) {
-                  log(`音频权限激活失败: ${playError.message}`, "warning");
+                // 隐藏提示
+                const hint = document.getElementById("appleAudioHint");
+                if (hint) {
+                  hint.style.display = "none";
                 }
+
+                // 移除监听器
+                document.removeEventListener(
+                  "click",
+                  activateAudioOnInteraction
+                );
+                document.removeEventListener(
+                  "touchstart",
+                  activateAudioOnInteraction
+                );
+
+                log("✅ 苹果设备音频系统已激活", "success");
               }
             } catch (error) {
-              log(`音频权限处理错误: ${error.message}`, "error");
+              log(`音频系统激活失败: ${error.message}`, "error");
             }
           };
 
