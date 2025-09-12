@@ -409,6 +409,7 @@
       let localStream = null;
       let audioContext = null;
       let analyser = null;
+      let audioSourceNode = null;
 
       // 苹果设备检测和音频权限管理
       const isAppleDevice = () => {
@@ -708,6 +709,9 @@
           try {
             log("🔄 重新初始化WebSocket音频模式...", "info");
 
+            // 清理音频可视化
+            cleanupAudioVisualization();
+
             // 清理旧的音频组件
             if (this.audioSender) {
               this.audioSender.stop();
@@ -737,6 +741,9 @@
             await this.audioReceiver.initGlobalAudio();
             await this.audioSender.startRecording(localStream);
 
+            // 重新初始化音频可视化
+            initAudioVisualization();
+
             log("✅ WebSocket音频模式重新初始化完成", "success");
           } catch (error) {
             log(`WebSocket模式重新初始化失败: ${error.message}`, "error");
@@ -747,6 +754,9 @@
         async disconnect() {
           try {
             log("正在断开连接...");
+
+            // 清理音频可视化
+            cleanupAudioVisualization();
 
             // 停止音频发送器
             if (this.audioSender) {
@@ -1945,11 +1955,8 @@
         try {
           log("正在断开连接...");
 
-          // 停止音频可视化
-          if (animationId) {
-            cancelAnimationFrame(animationId);
-            animationId = null;
-          }
+          // 清理音频可视化
+          cleanupAudioVisualization();
 
           // 停止本地流
           if (localStream) {
@@ -1982,13 +1989,27 @@
       // 初始化音频可视化
       function initAudioVisualization() {
         try {
-          audioContext = new (window.AudioContext ||
-            window.webkitAudioContext)();
+          // 确保localStream存在
+          if (!localStream) {
+            log("⚠️ 无本地音频流，跳过可视化", "warning");
+            return;
+          }
+
+          // 苹果保险做法：直接重建整个上下文
+          if (audioContext) {
+            audioContext.close();
+          }
+          const AudioContextClass =
+            window.AudioContext || window.webkitAudioContext;
+          audioContext = new AudioContextClass({ sampleRate: 16000 });
+
+          // 创建新的analyser
           analyser = audioContext.createAnalyser();
           analyser.fftSize = 256;
 
-          const source = audioContext.createMediaStreamSource(localStream);
-          source.connect(analyser);
+          // 创建新的音频源节点并连接
+          audioSourceNode = audioContext.createMediaStreamSource(localStream);
+          audioSourceNode.connect(analyser);
 
           const bufferLength = analyser.frequencyBinCount;
           dataArray = new Uint8Array(bufferLength);
@@ -1998,6 +2019,46 @@
         } catch (error) {
           log(`音频可视化初始化失败: ${error.message}`, "warning");
         }
+      }
+
+      // 清理音频可视化
+      function cleanupAudioVisualization() {
+        if (animationId) {
+          cancelAnimationFrame(animationId);
+          animationId = null;
+        }
+
+        // 断开并清理音频源节点
+        if (audioSourceNode) {
+          audioSourceNode.disconnect();
+          audioSourceNode = null;
+        }
+
+        // 断开并清理分析器节点
+        if (analyser) {
+          analyser.disconnect();
+          analyser = null;
+        }
+
+        dataArray = null;
+
+        // 清空电平显示
+        if (elements.audioLevel) {
+          elements.audioLevel.textContent = "0%";
+        }
+
+        // 清空画布
+        if (elements.audioCanvas) {
+          const canvasCtx = elements.audioCanvas.getContext("2d");
+          canvasCtx.clearRect(
+            0,
+            0,
+            elements.audioCanvas.width,
+            elements.audioCanvas.height
+          );
+        }
+
+        log("🎵 音频可视化已清理");
       }
 
       // 绘制音频可视化
