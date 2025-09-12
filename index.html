@@ -466,6 +466,7 @@
       class ConnectionManager {
         constructor() {
           this.state = ConnectionState.DISCONNECTED;
+          this.mode = "websocket";
           this.audioSender = null;
           this.audioReceiver = null;
         }
@@ -700,6 +701,46 @@
             );
           } else {
             log(`连接失败建议: 请检查网络连接或刷新页面重试`, "info");
+          }
+        }
+
+        async switchToWebSocketMode() {
+          try {
+            log("🔄 重新初始化WebSocket音频模式...", "info");
+
+            // 清理旧的音频组件
+            if (this.audioSender) {
+              this.audioSender.stop();
+              this.audioSender = null;
+            }
+            if (this.audioReceiver) {
+              this.audioReceiver.stop();
+              this.audioReceiver = null;
+            }
+
+            // 苹果设备特殊处理：重置音频权限状态和AudioContext
+            if (isAppleDevice()) {
+              audioPermissionGranted = false;
+              if (audioContext) {
+                audioContext.close();
+              }
+              // 重新创建AudioContext避免状态漂移
+              const AudioContextClass =
+                window.AudioContext || window.webkitAudioContext;
+              audioContext = new AudioContextClass({ sampleRate: 16000 });
+            }
+
+            // 重新初始化音频组件
+            this.audioSender = new AudioSender(websocket);
+            this.audioReceiver = new AudioReceiver(websocket);
+
+            await this.audioReceiver.initGlobalAudio();
+            await this.audioSender.startRecording(localStream);
+
+            log("✅ WebSocket音频模式重新初始化完成", "success");
+          } catch (error) {
+            log(`WebSocket模式重新初始化失败: ${error.message}`, "error");
+            throw error;
           }
         }
 
@@ -990,7 +1031,6 @@
 
           // 🆕 单一Audio对象复用策略
           this.globalAudio = null;
-          this.audioPermissionGranted = false;
           this.currentAudioUrl = null;
 
           // 🆕 Web Audio API支持（苹果设备打断机制）
@@ -1044,7 +1084,7 @@
             log("🍎 检查苹果设备音频权限状态...", "info");
 
             // 如果已经激活过，直接返回
-            if (this.audioPermissionGranted) {
+            if (audioPermissionGranted) {
               log("✅ 苹果设备音频权限已存在", "success");
               return;
             }
@@ -1063,7 +1103,7 @@
 
             // 🎯 不在这里播放任何音频，只检查AudioContext状态
             if (audioContext.state === "running") {
-              this.audioPermissionGranted = true;
+              audioPermissionGranted = true;
               log("✅ 苹果设备Web Audio API已准备就绪", "success");
             } else {
               log("⚠️ AudioContext状态异常，将在播放时重试", "warning");
@@ -1141,7 +1181,7 @@
             log(`✅ Web Audio API播放开始`, "success");
 
             // 标记权限已获得
-            this.audioPermissionGranted = true;
+            audioPermissionGranted = true;
           } catch (error) {
             this.currentWebAudioSource = null;
             this.isUsingWebAudio = false;
@@ -1164,7 +1204,7 @@
           if (isAppleDevice()) {
             log(`🍎 苹果设备音频播放错误: ${error.message || error}`, "error");
 
-            if (!this.audioPermissionGranted) {
+            if (!audioPermissionGranted) {
               log("💡 可能需要重新获取音频权限", "warning");
             }
           }
@@ -1174,7 +1214,7 @@
             retryCount: this.retryCount,
             queueLength: this.audioQueue.length,
             isAppleDevice: isAppleDevice(),
-            audioPermissionGranted: this.audioPermissionGranted,
+            audioPermissionGranted: audioPermissionGranted,
             audioContextState: audioContext ? audioContext.state : "none",
           });
 
@@ -1213,11 +1253,19 @@
             // 检测音频格式
             const audioFormat = metadata.audio_format || "webm";
 
+            // 🔍 调试日志：显示格式检测结果
+            log(
+              `🔍 [DEBUG] 音频格式检测: metadata.audio_format="${metadata.audio_format}", 最终格式="${audioFormat}"`,
+              "info"
+            );
+
             if (audioFormat === "mp3") {
               // 处理MP3音频（新格式）
+              log(`✅ [DEBUG] 调用handleMP3Audio方法`, "success");
               this.handleMP3Audio(audioData, metadata);
             } else {
               // 处理WebM音频（旧格式，保持兼容性）
+              log(`⚠️ [DEBUG] 调用handleWebMAudio方法`, "warning");
               this.handleWebMAudio(audioData, metadata);
             }
           } catch (error) {
@@ -1544,7 +1592,6 @@
           this.cleanupCurrentAudio();
           this.clearQueue();
           this.globalAudio = null;
-          this.audioPermissionGranted = false;
           log("🛑 AudioReceiver已停止", "info");
         }
 
@@ -1737,14 +1784,16 @@
             log("WebSocket连接已建立");
             elements.connectionStatus.textContent = "WebSocket已连接";
 
-            // 发送绑定消息
+            // 发送绑定消息 - 苹果设备延迟50ms避免"伪open"问题
             const bindMsg = {
               type: "bind",
               client_id: "web_client_" + Date.now(),
               timestamp: Date.now(),
             };
-            websocket.send(JSON.stringify(bindMsg));
-            log("已发送WebSocket绑定消息");
+            setTimeout(() => {
+              websocket.send(JSON.stringify(bindMsg));
+              log("已发送WebSocket绑定消息");
+            }, 50);
           };
 
           websocket.onmessage = (event) => {
