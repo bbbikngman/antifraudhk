@@ -432,6 +432,15 @@
 
         try {
           const config = await fetchAgoraConfig("publisher");
+          console.log("[DEBUG] 获取到的Agora配置:", {
+            appId: config.appId,
+            channel: config.channel,
+            uid: config.uid,
+            botUid: config.botUid,
+            token: config.token
+              ? `${config.token.substring(0, 20)}...`
+              : "null",
+          });
           elements.localUid.textContent = config.uid || "-";
           elements.channelName.textContent = config.channel || "-";
 
