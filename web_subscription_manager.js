@@ -1,622 +1,211 @@
 /**
- * 声网Web端显式订阅管理器
+ * 声网UID类型验证和兼容性检查 - Web端
  * 基于声网技术支持的专业建议实现
  */
 
-class WebSubscriptionManager {
+class WebUIDValidator {
   /**
-   * 订阅状态枚举
+   * 默认Bot UID（与Python端保持一致）
    */
-  static SubscriptionState = {
-    NOT_SUBSCRIBED: "not_subscribed",
-    SUBSCRIBING: "subscribing",
-    SUBSCRIBED: "subscribed",
-    SUBSCRIPTION_FAILED: "subscription_failed",
-    UNSUBSCRIBING: "unsubscribing",
-  };
+  static DEFAULT_BOT_UID = 12345;
 
   /**
-   * 订阅类型枚举
+   * 检查是否为Bot用户
+   * 支持整数和字符串UID的兼容性检查
+   *
+   * @param {any} uid - 待检查的UID
+   * @returns {boolean} 是否为Bot用户
    */
-  static SubscriptionType = {
-    AUDIO: "audio",
-    VIDEO: "video",
-    BOTH: "both",
-  };
+  static isBotUser(uid) {
+    try {
+      // 优先检查整数UID（Python端使用整数）
+      if (typeof uid === "number") {
+        return uid === this.DEFAULT_BOT_UID;
+      }
 
-  constructor(client, options = {}) {
-    this.client = client;
-    this.options = {
-      maxRetryAttempts: options.maxRetryAttempts || 3,
-      retryDelay: options.retryDelay || 2000,
-      subscriptionTimeout: options.subscriptionTimeout || 10000,
-      enableAutoSubscribe: options.enableAutoSubscribe !== false,
-      logLevel: options.logLevel || "info",
-      ...options,
+      // 兼容字符串UID
+      if (typeof uid === "string") {
+        try {
+          const uidInt = parseInt(uid, 10);
+          return !isNaN(uidInt) && uidInt === this.DEFAULT_BOT_UID;
+        } catch (error) {
+          console.warn("[UID_VALIDATOR] 字符串UID转换失败:", uid, error);
+          return false;
+        }
+      }
+
+      // 其他类型不支持
+      console.warn("[UID_VALIDATOR] 不支持的UID类型:", typeof uid, uid);
+      return false;
+    } catch (error) {
+      console.error("[UID_VALIDATOR] Bot用户检查异常:", error);
+      return false;
+    }
+  }
+
+  /**
+   * 验证Web SDK UID兼容性
+   * Web SDK支持字符串和整数UID（字符串UID支持）
+   *
+   * @param {any} uid - 待验证的UID
+   * @returns {boolean} 是否兼容
+   */
+  static isValidWebSDKUID(uid) {
+    try {
+      // 检查基本类型
+      if (typeof uid !== "number" && typeof uid !== "string") {
+        return false;
+      }
+
+      // 字符串UID支持 - 直接接受非空字符串
+      if (typeof uid === "string") {
+        // 字符串UID只需要非空即可（支持如 "user_1758595626139" 格式）
+        return uid.length > 0 && uid.trim().length > 0;
+      }
+
+      // 数字UID需要范围检查
+      if (typeof uid === "number") {
+        // 检查UID范围（声网UID范围：1 到 2^32-1）
+        return uid >= 1 && uid <= Math.pow(2, 32) - 1;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("[UID_VALIDATOR] Web SDK UID验证异常:", error);
+      return false;
+    }
+  }
+
+  /**
+   * 标准化UID比较
+   * 确保不同类型的UID能够正确比较
+   *
+   * @param {any} uid1 - 第一个UID
+   * @param {any} uid2 - 第二个UID
+   * @returns {boolean} 是否相等
+   */
+  static compareUIDs(uid1, uid2) {
+    try {
+      // 如果类型相同，直接比较
+      if (typeof uid1 === typeof uid2) {
+        return uid1 === uid2;
+      }
+
+      // 类型不同，转换为数字比较
+      const num1 = typeof uid1 === "number" ? uid1 : parseInt(uid1, 10);
+      const num2 = typeof uid2 === "number" ? uid2 : parseInt(uid2, 10);
+
+      // 检查转换是否成功
+      if (isNaN(num1) || isNaN(num2)) {
+        return false;
+      }
+
+      return num1 === num2;
+    } catch (error) {
+      console.error("[UID_VALIDATOR] UID比较异常:", error);
+      return false;
+    }
+  }
+
+  /**
+   * 获取默认Bot UID
+   *
+   * @returns {number} 默认Bot UID
+   */
+  static getDefaultBotUID() {
+    return this.DEFAULT_BOT_UID;
+  }
+
+  /**
+   * 验证配置中的UID设置
+   *
+   * @param {Object} config - 包含UID配置的对象
+   * @returns {Object} 验证结果
+   */
+  static validateConfiguration(config) {
+    const result = {
+      isValid: true,
+      errors: [],
+      warnings: [],
+      config: { ...config },
     };
-
-    // 订阅状态跟踪
-    this.subscriptions = new Map(); // uid -> subscription info
-    this.subscriptionHistory = [];
-    this.retryTimers = new Map(); // uid -> timer
-
-    // 回调函数
-    this.onSubscriptionSuccess = null;
-    this.onSubscriptionFailed = null;
-    this.onSubscriptionStateChanged = null;
-
-    // 绑定事件处理器
-    this._bindEventHandlers();
-
-    this._log("info", "显式订阅管理器初始化完成", { options: this.options });
-  }
-
-  /**
-   * 绑定事件处理器
-   */
-  _bindEventHandlers() {
-    // 用户加入事件 - 声网技术支持建议：显式订阅确保兼容性
-    this.client.on("user-joined", this._handleUserJoined.bind(this));
-    this.client.on("user-published", this._handleUserPublished.bind(this));
-    this.client.on("user-unpublished", this._handleUserUnpublished.bind(this));
-    this.client.on("user-left", this._handleUserLeft.bind(this));
-
-    this._log("debug", "事件处理器绑定完成");
-  }
-
-  /**
-   * 处理用户加入事件
-   */
-  async _handleUserJoined(user) {
-    this._log("info", `用户加入事件: ${user.uid}`, {
-      uid: user.uid,
-      hasAudio: user.hasAudio,
-      hasVideo: user.hasVideo,
-    });
-
-    // 记录用户信息
-    this._updateSubscriptionInfo(user.uid, {
-      state: WebSubscriptionManager.SubscriptionState.NOT_SUBSCRIBED,
-      user: user,
-      joinedAt: new Date(),
-      hasAudio: user.hasAudio,
-      hasVideo: user.hasVideo,
-    });
-
-    // 如果启用自动订阅且用户有媒体流，则尝试订阅
-    if (this.options.enableAutoSubscribe) {
-      if (user.hasAudio || user.hasVideo) {
-        await this._attemptAutoSubscription(user);
-      } else {
-        this._log("debug", `用户 ${user.uid} 暂无媒体流，等待发布事件`);
-      }
-    }
-  }
-
-  /**
-   * 处理用户发布事件
-   */
-  async _handleUserPublished(user, mediaType) {
-    this._log("info", `用户发布事件: ${user.uid}, 媒体类型: ${mediaType}`, {
-      uid: user.uid,
-      mediaType: mediaType,
-      hasAudio: user.hasAudio,
-      hasVideo: user.hasVideo,
-    });
-
-    // 更新用户媒体状态
-    const subscriptionInfo = this.subscriptions.get(user.uid);
-    if (subscriptionInfo) {
-      subscriptionInfo.hasAudio = user.hasAudio;
-      subscriptionInfo.hasVideo = user.hasVideo;
-      subscriptionInfo.user = user;
-    }
-
-    // 如果启用自动订阅，尝试订阅新发布的媒体
-    if (this.options.enableAutoSubscribe) {
-      await this.subscribeToUser(user.uid, mediaType);
-    }
-  }
-
-  /**
-   * 处理用户取消发布事件
-   */
-  _handleUserUnpublished(user, mediaType) {
-    this._log("info", `用户取消发布事件: ${user.uid}, 媒体类型: ${mediaType}`, {
-      uid: user.uid,
-      mediaType: mediaType,
-    });
-
-    // 更新订阅状态
-    const subscriptionInfo = this.subscriptions.get(user.uid);
-    if (subscriptionInfo) {
-      if (mediaType === "audio") {
-        subscriptionInfo.hasAudio = false;
-        subscriptionInfo.audioSubscribed = false;
-      } else if (mediaType === "video") {
-        subscriptionInfo.hasVideo = false;
-        subscriptionInfo.videoSubscribed = false;
-      }
-    }
-  }
-
-  /**
-   * 处理用户离开事件
-   */
-  _handleUserLeft(user) {
-    this._log("info", `用户离开事件: ${user.uid}`);
-
-    // 清理订阅信息
-    this._cleanupUserSubscription(user.uid);
-  }
-
-  /**
-   * 尝试自动订阅
-   */
-  async _attemptAutoSubscription(user) {
-    const subscriptionTypes = [];
-
-    if (user.hasAudio) {
-      subscriptionTypes.push("audio");
-    }
-    if (user.hasVideo) {
-      subscriptionTypes.push("video");
-    }
-
-    if (subscriptionTypes.length > 0) {
-      this._log("info", `自动订阅用户 ${user.uid}`, {
-        types: subscriptionTypes,
-      });
-
-      for (const type of subscriptionTypes) {
-        await this.subscribeToUser(user.uid, type);
-      }
-    }
-  }
-
-  /**
-   * 订阅用户媒体流
-   */
-  async subscribeToUser(uid, mediaType = "audio", options = {}) {
-    const subscriptionInfo = this.subscriptions.get(uid);
-    if (!subscriptionInfo) {
-      this._log("error", `用户 ${uid} 不存在，无法订阅`);
-      return false;
-    }
-
-    const user = subscriptionInfo.user;
-    if (!user) {
-      this._log("error", `用户 ${uid} 对象不存在，无法订阅`);
-      return false;
-    }
-
-    // 检查媒体类型可用性
-    if (mediaType === "audio" && !user.hasAudio) {
-      this._log("warn", `用户 ${uid} 没有音频流，跳过音频订阅`);
-      return false;
-    }
-    if (mediaType === "video" && !user.hasVideo) {
-      this._log("warn", `用户 ${uid} 没有视频流，跳过视频订阅`);
-      return false;
-    }
-
-    // 检查是否已经订阅
-    const isAlreadySubscribed = this._isAlreadySubscribed(uid, mediaType);
-    if (isAlreadySubscribed) {
-      this._log("debug", `用户 ${uid} 的 ${mediaType} 已订阅，跳过`);
-      return true;
-    }
-
-    return await this._subscribeWithRetry(uid, user, mediaType, options);
-  }
-
-  /**
-   * 带重试的订阅
-   */
-  async _subscribeWithRetry(uid, user, mediaType, options = {}) {
-    const maxAttempts =
-      options.maxRetryAttempts || this.options.maxRetryAttempts;
-    const retryDelay = options.retryDelay || this.options.retryDelay;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        this._log(
-          "info",
-          `订阅用户 ${uid} 的 ${mediaType} - 尝试 ${attempt}/${maxAttempts}`
-        );
-
-        // 更新订阅状态
-        this._updateSubscriptionState(
-          uid,
-          mediaType,
-          WebSubscriptionManager.SubscriptionState.SUBSCRIBING
-        );
-
-        // 执行订阅
-        const result = await this._performSubscription(user, mediaType);
-
-        if (result) {
-          // 订阅成功
-          this._updateSubscriptionState(
-            uid,
-            mediaType,
-            WebSubscriptionManager.SubscriptionState.SUBSCRIBED
-          );
-          this._recordSubscriptionAttempt(uid, mediaType, true, attempt);
-
-          this._log("info", `✅ 用户 ${uid} 的 ${mediaType} 订阅成功`);
-
-          // 调用成功回调
-          if (this.onSubscriptionSuccess) {
-            try {
-              this.onSubscriptionSuccess(uid, mediaType, result);
-            } catch (error) {
-              this._log("error", "订阅成功回调执行失败", {
-                error: error.message,
-              });
-            }
-          }
-
-          return true;
-        }
-      } catch (error) {
-        const errorMessage = `订阅失败 (尝试 ${attempt}/${maxAttempts}): ${error.message}`;
-        this._log("error", `❌ 用户 ${uid} 的 ${mediaType} ${errorMessage}`);
-
-        // 记录失败尝试
-        this._recordSubscriptionAttempt(
-          uid,
-          mediaType,
-          false,
-          attempt,
-          error.message
-        );
-
-        // 如果不是最后一次尝试，等待后重试
-        if (attempt < maxAttempts) {
-          const waitTime = retryDelay * attempt; // 递增等待时间
-          this._log("info", `⏳ ${waitTime}ms 后重试订阅...`);
-          await this._sleep(waitTime);
-        } else {
-          // 最终失败
-          this._updateSubscriptionState(
-            uid,
-            mediaType,
-            WebSubscriptionManager.SubscriptionState.SUBSCRIPTION_FAILED
-          );
-
-          // 调用失败回调
-          if (this.onSubscriptionFailed) {
-            try {
-              this.onSubscriptionFailed(uid, mediaType, error);
-            } catch (callbackError) {
-              this._log("error", "订阅失败回调执行失败", {
-                error: callbackError.message,
-              });
-            }
-          }
-        }
-      }
-    }
-
-    this._log(
-      "error",
-      `❌ 用户 ${uid} 的 ${mediaType} 订阅最终失败，已达到最大重试次数`
-    );
-    return false;
-  }
-
-  /**
-   * 执行实际的订阅操作
-   */
-  async _performSubscription(user, mediaType) {
-    const timeout = this.options.subscriptionTimeout;
-
-    return new Promise(async (resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        reject(new Error(`订阅超时 (${timeout}ms)`));
-      }, timeout);
-
-      try {
-        let result;
-
-        if (mediaType === "audio") {
-          result = await this.client.subscribe(user, "audio");
-        } else if (mediaType === "video") {
-          result = await this.client.subscribe(user, "video");
-        } else {
-          throw new Error(`不支持的媒体类型: ${mediaType}`);
-        }
-
-        clearTimeout(timeoutId);
-        resolve(result);
-      } catch (error) {
-        clearTimeout(timeoutId);
-        reject(error);
-      }
-    });
-  }
-
-  /**
-   * 取消订阅用户媒体流
-   */
-  async unsubscribeFromUser(uid, mediaType = "audio") {
-    const subscriptionInfo = this.subscriptions.get(uid);
-    if (!subscriptionInfo) {
-      this._log("warn", `用户 ${uid} 不存在，无法取消订阅`);
-      return false;
-    }
-
-    const user = subscriptionInfo.user;
-    if (!user) {
-      this._log("warn", `用户 ${uid} 对象不存在，无法取消订阅`);
-      return false;
-    }
 
     try {
-      this._log("info", `取消订阅用户 ${uid} 的 ${mediaType}`);
-
-      // 更新状态
-      this._updateSubscriptionState(
-        uid,
-        mediaType,
-        WebSubscriptionManager.SubscriptionState.UNSUBSCRIBING
-      );
-
-      // 执行取消订阅
-      await this.client.unsubscribe(user, mediaType);
-
-      // 更新状态
-      this._updateSubscriptionState(
-        uid,
-        mediaType,
-        WebSubscriptionManager.SubscriptionState.NOT_SUBSCRIBED
-      );
-
-      this._log("info", `✅ 用户 ${uid} 的 ${mediaType} 取消订阅成功`);
-      return true;
-    } catch (error) {
-      this._log("error", `❌ 取消订阅失败: ${error.message}`);
-      this._updateSubscriptionState(
-        uid,
-        mediaType,
-        WebSubscriptionManager.SubscriptionState.SUBSCRIPTION_FAILED
-      );
-      return false;
-    }
-  }
-
-  /**
-   * 检查是否已经订阅
-   */
-  _isAlreadySubscribed(uid, mediaType) {
-    const subscriptionInfo = this.subscriptions.get(uid);
-    if (!subscriptionInfo) return false;
-
-    if (mediaType === "audio") {
-      return subscriptionInfo.audioSubscribed === true;
-    } else if (mediaType === "video") {
-      return subscriptionInfo.videoSubscribed === true;
-    }
-
-    return false;
-  }
-
-  /**
-   * 更新订阅信息
-   */
-  _updateSubscriptionInfo(uid, info) {
-    const existing = this.subscriptions.get(uid) || {};
-    const updated = { ...existing, ...info, updatedAt: new Date() };
-    this.subscriptions.set(uid, updated);
-  }
-
-  /**
-   * 更新订阅状态
-   */
-  _updateSubscriptionState(uid, mediaType, state) {
-    const subscriptionInfo = this.subscriptions.get(uid);
-    if (!subscriptionInfo) return;
-
-    if (mediaType === "audio") {
-      subscriptionInfo.audioState = state;
-      subscriptionInfo.audioSubscribed =
-        state === WebSubscriptionManager.SubscriptionState.SUBSCRIBED;
-    } else if (mediaType === "video") {
-      subscriptionInfo.videoState = state;
-      subscriptionInfo.videoSubscribed =
-        state === WebSubscriptionManager.SubscriptionState.SUBSCRIBED;
-    }
-
-    subscriptionInfo.updatedAt = new Date();
-
-    // 调用状态变化回调
-    if (this.onSubscriptionStateChanged) {
-      try {
-        this.onSubscriptionStateChanged(uid, mediaType, state);
-      } catch (error) {
-        this._log("error", "订阅状态变化回调执行失败", {
-          error: error.message,
-        });
+      // 检查botUid
+      if ("botUid" in config) {
+        if (!this.isValidWebSDKUID(config.botUid)) {
+          result.errors.push(`无效的botUid: ${config.botUid}`);
+          result.isValid = false;
+        } else {
+          // 检查是否为预期的Bot UID
+          if (!this.isBotUser(config.botUid)) {
+            result.warnings.push(
+              `botUid不是预期的Bot UID: ${config.botUid} (预期: ${this.DEFAULT_BOT_UID})`
+            );
+          }
+        }
       }
-    }
-  }
 
-  /**
-   * 记录订阅尝试
-   */
-  _recordSubscriptionAttempt(
-    uid,
-    mediaType,
-    success,
-    attempt,
-    errorMessage = null
-  ) {
-    const record = {
-      uid,
-      mediaType,
-      success,
-      attempt,
-      timestamp: new Date(),
-      errorMessage,
-    };
-
-    this.subscriptionHistory.push(record);
-
-    // 限制历史记录长度
-    if (this.subscriptionHistory.length > 100) {
-      this.subscriptionHistory = this.subscriptionHistory.slice(-50);
-    }
-  }
-
-  /**
-   * 清理用户订阅信息
-   */
-  _cleanupUserSubscription(uid) {
-    // 清理重试定时器
-    const timer = this.retryTimers.get(uid);
-    if (timer) {
-      clearTimeout(timer);
-      this.retryTimers.delete(uid);
+      // 检查uid
+      if ("uid" in config) {
+        if (!this.isValidWebSDKUID(config.uid)) {
+          result.errors.push(`无效的uid: ${config.uid}`);
+          result.isValid = false;
+        }
+      }
+    } catch (error) {
+      result.errors.push(`配置验证异常: ${error.message}`);
+      result.isValid = false;
     }
 
-    // 移除订阅信息
-    this.subscriptions.delete(uid);
-
-    this._log("debug", `用户 ${uid} 的订阅信息已清理`);
-  }
-
-  /**
-   * 获取订阅统计信息
-   */
-  getSubscriptionStats() {
-    const totalUsers = this.subscriptions.size;
-    let audioSubscribed = 0;
-    let videoSubscribed = 0;
-    let totalAttempts = this.subscriptionHistory.length;
-    let successfulAttempts = this.subscriptionHistory.filter(
-      (record) => record.success
-    ).length;
-
-    for (const [uid, info] of this.subscriptions) {
-      if (info.audioSubscribed) audioSubscribed++;
-      if (info.videoSubscribed) videoSubscribed++;
-    }
-
-    const successRate =
-      totalAttempts > 0 ? (successfulAttempts / totalAttempts) * 100 : 0;
-
-    return {
-      totalUsers,
-      audioSubscribed,
-      videoSubscribed,
-      totalAttempts,
-      successfulAttempts,
-      successRate: `${successRate.toFixed(1)}%`,
-      autoSubscribeEnabled: this.options.enableAutoSubscribe,
-    };
-  }
-
-  /**
-   * 获取用户订阅信息
-   */
-  getUserSubscriptionInfo(uid) {
-    const info = this.subscriptions.get(uid);
-    if (!info) return null;
-
-    return {
-      uid,
-      hasAudio: info.hasAudio,
-      hasVideo: info.hasVideo,
-      audioSubscribed: info.audioSubscribed || false,
-      videoSubscribed: info.videoSubscribed || false,
-      audioState:
-        info.audioState ||
-        WebSubscriptionManager.SubscriptionState.NOT_SUBSCRIBED,
-      videoState:
-        info.videoState ||
-        WebSubscriptionManager.SubscriptionState.NOT_SUBSCRIBED,
-      joinedAt: info.joinedAt,
-      updatedAt: info.updatedAt,
-    };
-  }
-
-  /**
-   * 获取所有用户订阅信息
-   */
-  getAllSubscriptionInfo() {
-    const result = [];
-    for (const [uid, info] of this.subscriptions) {
-      result.push(this.getUserSubscriptionInfo(uid));
-    }
     return result;
   }
 
   /**
-   * 启用/禁用自动订阅
+   * 记录UID相关的调试信息
+   *
+   * @param {string} context - 上下文信息
+   * @param {any} uid - UID值
+   * @param {Object} additionalInfo - 额外信息
    */
-  setAutoSubscribe(enabled) {
-    this.options.enableAutoSubscribe = enabled;
-    this._log("info", `自动订阅: ${enabled ? "启用" : "禁用"}`);
+  static logUIDInfo(context, uid, additionalInfo = {}) {
+    console.log(`[UID_VALIDATOR] ${context}:`, {
+      uid: uid,
+      type: typeof uid,
+      isBot: this.isBotUser(uid),
+      isValid: this.isValidWebSDKUID(uid),
+      ...additionalInfo,
+    });
   }
+}
 
-  /**
-   * 睡眠函数
-   */
-  _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
+// 便捷函数
+function isBotUser(uid) {
+  return WebUIDValidator.isBotUser(uid);
+}
 
-  /**
-   * 日志记录
-   */
-  _log(level, message, data = null) {
-    const logLevels = { debug: 0, info: 1, warn: 2, error: 3 };
-    const currentLevel = logLevels[this.options.logLevel] || 1;
-    const messageLevel = logLevels[level] || 1;
+function isValidUID(uid) {
+  return WebUIDValidator.isValidWebSDKUID(uid);
+}
 
-    if (messageLevel >= currentLevel) {
-      const prefix = "[SUBSCRIPTION_MANAGER]";
-      const timestamp = new Date().toISOString();
-
-      if (data) {
-        console[level](`${prefix} ${timestamp} ${message}`, data);
-      } else {
-        console[level](`${prefix} ${timestamp} ${message}`);
-      }
-    }
-  }
-
-  /**
-   * 销毁订阅管理器
-   */
-  destroy() {
-    // 清理所有定时器
-    for (const [uid, timer] of this.retryTimers) {
-      clearTimeout(timer);
-    }
-    this.retryTimers.clear();
-
-    // 清理订阅信息
-    this.subscriptions.clear();
-    this.subscriptionHistory = [];
-
-    // 移除事件监听器
-    this.client.off("user-joined", this._handleUserJoined);
-    this.client.off("user-published", this._handleUserPublished);
-    this.client.off("user-unpublished", this._handleUserUnpublished);
-    this.client.off("user-left", this._handleUserLeft);
-
-    this._log("info", "订阅管理器已销毁");
-  }
+function compareUIDs(uid1, uid2) {
+  return WebUIDValidator.compareUIDs(uid1, uid2);
 }
 
 // 导出（如果在模块环境中）
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = WebSubscriptionManager;
+  module.exports = {
+    WebUIDValidator,
+    isBotUser,
+    isValidUID,
+    compareUIDs,
+  };
 }
 
 // 全局暴露（如果在浏览器环境中）
 if (typeof window !== "undefined") {
-  window.WebSubscriptionManager = WebSubscriptionManager;
+  window.WebUIDValidator = WebUIDValidator;
+  window.isBotUser = isBotUser;
+  window.isValidUID = isValidUID;
+  window.compareUIDs = compareUIDs;
 }

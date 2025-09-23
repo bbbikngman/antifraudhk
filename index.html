@@ -557,8 +557,8 @@
             enableAutoSubscribe: true,
             logLevel: "info",
           });
-          subscriptionManager.initialize(config.botUid);
-          subscriptionManager.setSubscriptionCallback(handleSubscription);
+          // 注意：WebSubscriptionManager不需要initialize方法，构造函数已完成初始化
+          // subscriptionManager.setSubscriptionCallback(handleSubscription); // 此方法也不存在，使用回调属性代替
 
           // 设置订阅管理器回调
           subscriptionManager.onSubscriptionSuccess = (
@@ -758,37 +758,25 @@
               const isBot = WebUIDValidator.isBotUser(user.uid);
 
               try {
-                const success = await subscriptionManager.subscribeUser(
-                  user,
-                  "audio",
-                  {
-                    onSuccess: (user, mediaType) => {
-                      if (isBot) {
-                        console.log(
-                          "[SUBSCRIBE] 🤖 Bot用户音频订阅成功，准备播放"
-                        );
-                        log("Bot连接", `Bot用户 ${user.uid} 音频流已订阅`);
-                      }
-                    },
-                    onError: (user, mediaType, error) => {
-                      log(
-                        "订阅失败",
-                        `用户 ${user.uid} 音频订阅失败: ${error}`
-                      );
-                    },
-                  }
+                const success = await subscriptionManager.subscribeToUser(
+                  user.uid,
+                  "audio"
                 );
+                
+                // 订阅结果处理（成功/失败回调已在实例级别设置）
+                if (success && isBot) {
+                  console.log(
+                    "[SUBSCRIBE] 🤖 Bot用户音频订阅成功，准备播放"
+                  );
+                  log("Bot连接", `Bot用户 ${user.uid} 音频流已订阅`);
+                }
 
                 // 如果是Bot用户且订阅失败，启动自动重试
                 if (isBot && !success) {
                   console.log(
-                    "[SUBSCRIBE] 🔄 Bot用户订阅失败，启动自动重试机制"
+                    "[SUBSCRIBE] 🔄 Bot用户订阅失败，重试机制已自动启动"
                   );
-                  subscriptionManager.scheduleRetrySubscription(
-                    user,
-                    "audio",
-                    3
-                  );
+                  // 注意：WebSubscriptionManager 内置重试机制，无需手动调度
                 }
               } catch (error) {
                 console.error("[SUBSCRIBE] ❌ 订阅管理器处理失败:", error);
