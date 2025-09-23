@@ -445,6 +445,7 @@
 
       // 竞争性单通道相关变量
       const CHANNEL = "solidchannel";
+      const API_BASE_URL = "https://cityuantifraud.com"; // 后端API基础URL
       let sessionId, token, uid, appId;
       let beatTimer;
 
@@ -461,7 +462,7 @@
         try {
           if (sessionId) {
             // sendBeacon 确保页面关闭时也能发出
-            const leaveUrl = `${window.location.origin}/rtc/leave`;
+            const leaveUrl = `${API_BASE_URL}/rtc/leave`;
             navigator.sendBeacon(leaveUrl, new Blob([JSON.stringify({channel:CHANNEL, sessionId})], {type:"application/json"}));
             log("系统", "已释放房间锁");
           }
@@ -495,7 +496,7 @@
 
         try {
           // 1) 申请进入（拿锁+拿token）
-          const enterUrl = `${window.location.origin}/rtc/enter`;
+          const enterUrl = `${API_BASE_URL}/rtc/enter`;
           console.log("请求URL:", enterUrl);
           const response = await fetch(enterUrl, {
             method: "POST",
@@ -534,7 +535,7 @@
 
           // 2) 心跳（10s一次）——断网/崩溃后 25s 自动释放
           beatTimer = setInterval(()=> {
-            const beatUrl = `${window.location.origin}/rtc/beat`;
+            const beatUrl = `${API_BASE_URL}/rtc/beat`;
             navigator.sendBeacon(beatUrl, new Blob([JSON.stringify({channel:CHANNEL, sessionId})], {type:"application/json"}));
           }, 10000);
 
