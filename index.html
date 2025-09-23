@@ -442,48 +442,111 @@
         }
       }
 
-      async function connect() {
+      // 竞争性单通道相关变量
+      const CHANNEL = "solidchannel";
+      let sessionId, token, uid, appId;
+      let beatTimer;
+
+      async function leaveAndCleanup() {
+        try {
+          if (client && client.connectionState !== "DISCONNECTED") {
+            await client.leave();
+            log("声网", "已离开频道");
+          }
+        } catch(e) {
+          console.error("离开频道失败:", e);
+        }
+        
+        try {
+          if (sessionId) {
+            // sendBeacon 确保页面关闭时也能发出
+            navigator.sendBeacon("/rtc/leave", new Blob([JSON.stringify({channel:CHANNEL, sessionId})], {type:"application/json"}));
+            log("系统", "已释放房间锁");
+          }
+        } catch(e) {
+          console.error("释放房间锁失败:", e);
+        }
+        
+        clearInterval(beatTimer); 
+        beatTimer = null;
+        sessionId = token = uid = appId = null;
+        
+        // 清理音频轨道
+        if (microphoneAudioTrack) {
+          microphoneAudioTrack.close();
+          microphoneAudioTrack = null;
+        }
+        
+        setConnectionState("offline", "已断开连接");
+        elements.connectButton.disabled = false;
+        isConnecting = false;
+      }
+
+      async function enterAndJoin() {
         if (isConnecting) {
           return;
         }
         isConnecting = true;
-        setConnectionState("idle", "正在初始化声网通道...");
+        setConnectionState("idle", "正在申请进入房间...");
         elements.connectButton.disabled = true;
-        log("系统", "准备连接声网 RTC...");
+        log("系统", "申请进入房间（竞争性获取锁）...");
 
         try {
-          const config = await fetchAgoraConfig("publisher");
-          console.log("[DEBUG] 获取到的Agora配置:", {
-            appId: config.appId,
-            channel: config.channel,
-            uid: config.uid,
-            botUid: config.botUid,
-            token: config.token
-              ? `${config.token.substring(0, 20)}...`
-              : "null",
-          });
-          elements.localUid.textContent = config.uid || "-";
-          elements.channelName.textContent = config.channel || "-";
+          // 1) 申请进入（拿锁+拿token）
+          const r = await fetch("/rtc/enter", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ channel: CHANNEL })
+          }).then(r=>r.json());
 
+          if (!r.ok) {
+            if (r.reason === "BUSY") {
+              alert("当前线路正忙，请稍后再试。");
+              log("系统", "房间被占用，无法进入", "error");
+            } else {
+              alert(`进入房间失败: ${r.reason}`);
+              log("系统", `进入房间失败: ${r.reason}`, "error");
+            }
+            setConnectionState("offline", "进入房间失败");
+            elements.connectButton.disabled = false;
+            isConnecting = false;
+            return;
+          }
+
+          sessionId = r.sessionId; 
+          token = r.token; 
+          uid = r.uid; 
+          appId = r.appId;
+          
+          log("系统", `成功获取房间锁，会话ID: ${sessionId}`);
+          elements.localUid.textContent = uid || "-";
+          elements.channelName.textContent = CHANNEL;
+
+          // 2) 心跳（10s一次）——断网/崩溃后 25s 自动释放
+          beatTimer = setInterval(()=> {
+            navigator.sendBeacon("/rtc/beat", new Blob([JSON.stringify({channel:CHANNEL, sessionId})], {type:"application/json"}));
+          }, 10000);
+
+          setConnectionState("idle", "正在加入声网频道...");
+          
           if (client.connectionState !== "DISCONNECTED") {
             await client.leave().catch(() => {});
           }
 
-          await client.join(
-            config.appId,
-            config.channel,
-            config.token || null,
-            config.uid || null
-          );
-          log("声网", `已加入频道 ${config.channel}`);
+          // 3) 加入频道
+          await client.join(appId, CHANNEL, token, uid);
+          log("声网", `已加入频道 ${CHANNEL}`);
 
-          // 初始化订阅管理器 - 声网技术支持建议：显式订阅确保兼容性
+          // 4) 初始化订阅管理器（监听Bot用户）
+          const config = await fetchAgoraConfig("publisher"); // 获取botUid
           subscriptionManager = new WebSubscriptionManager(client, {
             maxRetryAttempts: 3,
             retryDelay: 2000,
             enableAutoSubscribe: true,
             logLevel: "info",
           });
+          subscriptionManager.initialize(config.botUid);
+          subscriptionManager.setSubscriptionCallback(handleSubscription);
 
           // 设置订阅管理器回调
           subscriptionManager.onSubscriptionSuccess = (
@@ -828,10 +891,8 @@
       }
 
       async function disconnect() {
-        elements.connectButton.disabled = false;
         elements.disconnectButton.disabled = true;
-        setConnectionState("offline", "连接已关闭，可随时重新加入频道");
-
+        
         try {
           client.off("user-published", handleUserPublished);
           client.off("user-unpublished", handleUserUnpublished);
@@ -858,12 +919,12 @@
             console.log("[SUBSCRIPTION] 订阅管理器已清理");
           }
 
-          if (client.connectionState !== "DISCONNECTED") {
-            await client.leave();
-          }
-          log("系统", "已离开声网频道");
+          // 调用统一的清理函数（包含房间锁释放）
+          await leaveAndCleanup();
         } catch (error) {
           log("错误", `断开连接出现问题: ${error.message}`);
+          // 即使出错也要尝试清理
+          await leaveAndCleanup();
         }
       }
 
@@ -970,7 +1031,7 @@
         }
       }
 
-      elements.connectButton.addEventListener("click", connect);
+      elements.connectButton.addEventListener("click", enterAndJoin);
       elements.disconnectButton.addEventListener("click", disconnect);
 
       elements.volumeSlider.addEventListener("input", (event) => {
@@ -981,9 +1042,18 @@
         }
       });
 
-      window.addEventListener("beforeunload", () => {
-        if (client.connectionState !== "DISCONNECTED") {
-          client.leave();
+      // —— 挂到所有退出路径 ——
+      // 1) 关闭/刷新
+      window.addEventListener("beforeunload", leaveAndCleanup);
+      window.addEventListener("pagehide", leaveAndCleanup);     // iOS Safari
+      // 2) 页面可见性变化（可选：后台停播，前台再播）
+      window.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          console.log("[DEBUG] 页面进入后台");
+          // 可选：暂停某些操作
+        } else {
+          console.log("[DEBUG] 页面回到前台");
+          // 可选：恢复某些操作
         }
       });
 
